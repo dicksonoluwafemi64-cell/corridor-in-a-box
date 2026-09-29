@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import type { BreakerRecord } from "@corridor/engine";
 import {
+  currentUser,
   formatBreakerRecord,
   formatBreakerReset,
   formatBreakerTable,
@@ -36,6 +37,34 @@ function run(args: string[], env: NodeJS.ProcessEnv = {}) {
     env: { ...process.env, DATABASE_URL: "", ...env },
   });
 }
+
+// `currentUser` reads the OS account, and the interesting half of that is the
+// fallback chain, which only runs when the OS lookup fails — as it does in a
+// distroless container with no passwd entry for the running uid. That cannot be
+// provoked from this box, where userInfo() always succeeds, so it is stubbed.
+// Default state is "the real lookup succeeded", which is the production path.
+const osUser = vi.hoisted(() => ({
+  mode: "real" as "real" | "throw" | "empty",
+  value: "ada",
+}));
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return {
+    ...actual,
+    userInfo: () => {
+      if (osUser.mode === "throw") {
+        throw new Error("uv_os_get_passwd failed: no entry for this uid");
+      }
+      return { ...actual.userInfo(), username: osUser.mode === "empty" ? "" : osUser.value };
+    },
+  };
+});
+
+afterEach(() => {
+  osUser.mode = "real";
+  osUser.value = "ada";
+});
 
 describe("corridor CLI", () => {
   it("prints usage and exits 2 with no args", () => {
@@ -360,5 +389,52 @@ describe("breaker status output", () => {
       false,
     );
     expect(out).toContain("was not halted");
+  });
+});
+
+// The reset is only auditable if the name in `reset_by` is the person who ran
+// the command, so the function that produces it is worth pinning on its own.
+// The plumbing that passes it to `store.reset` is covered by the store tests;
+// what those cannot see is whether this function can lose the field entirely.
+describe("currentUser", () => {
+  it("prefers the OS account over the environment", () => {
+    osUser.mode = "real";
+    osUser.value = "ada";
+    // Every variable is set: if the env were consulted first, or first-wins
+    // were wrong, this would return something else and the recorded `reset_by`
+    // would name the wrong person.
+    expect(currentUser({ USER: "from-env", USERNAME: "from-env", LOGNAME: "from-env" })).toBe(
+      "ada",
+    );
+  });
+
+  it("falls back through USER, USERNAME and LOGNAME when the OS lookup fails", () => {
+    // The distroless-container path: no passwd entry for the uid, so the audit
+    // field survives on the environment instead of being lost.
+    osUser.mode = "throw";
+    expect(currentUser({ USER: "ada", USERNAME: "grace", LOGNAME: "alan" })).toBe("ada");
+    expect(currentUser({ USERNAME: "grace", LOGNAME: "alan" })).toBe("grace");
+    expect(currentUser({ LOGNAME: "alan" })).toBe("alan");
+  });
+
+  it("treats an empty OS username as no username", () => {
+    osUser.mode = "empty";
+    expect(currentUser({ USERNAME: "grace" })).toBe("grace");
+  });
+
+  it("returns 'unknown' only when every source is empty", () => {
+    // The last resort, and it is a real value rather than a blank string: a
+    // blank `reset_by` would read as a reset nobody was accountable for.
+    osUser.mode = "throw";
+    expect(currentUser({})).toBe("unknown");
+    expect(currentUser({ USER: "", USERNAME: "", LOGNAME: "" })).toBe("unknown");
+  });
+
+  it("always returns a non-blank name on this machine", () => {
+    osUser.mode = "real";
+    osUser.value = "ada";
+    const u = currentUser({});
+    expect(u.length).toBeGreaterThan(0);
+    expect(u.trim()).toBe(u);
   });
 });
