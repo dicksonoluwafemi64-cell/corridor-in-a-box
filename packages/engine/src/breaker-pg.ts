@@ -120,6 +120,12 @@ export class PostgresCorridorHealthStore implements CorridorHealthStore {
    *  - `state` is sticky. A failure on an already-`open` lane leaves it open and
    *    leaves `tripped_at` untouched, so a trip is one event — `tripped_at` is
    *    the marker `justTripped` keys on — and not one per failure.
+   *  - The INSERT branch carries `tripped_at` as well, because a lane whose
+   *    first-ever failure is also the trip (threshold 1) is created by the
+   *    insert, not the conflict clause. Omitting it there produced a row that
+   *    said `open` with a null trip time, and since `justTripped` matches on
+   *    that time, `corridor_breaker_tripped` stayed silent for exactly the
+   *    lanes that trip on contact.
    *  - `last_error` is carried forward rather than cleared by a success, so the
    *    operator can still see why a lane was in trouble after it recovered.
    *  - `reset_by`/`reset_reason` are history: an outcome never overwrites them.
@@ -133,10 +139,11 @@ export class PostgresCorridorHealthStore implements CorridorHealthStore {
     const failure = outcome === "failure";
     const res = await this.db.query<Row>(
       `insert into corridor_breakers
-         (corridor_id, consecutive_failures, state, last_error, updated_at)
+         (corridor_id, consecutive_failures, state, tripped_at, last_error, updated_at)
        values ($1,
                case when $2 then 1 else 0 end,
                case when $2 and 1 >= $4 then 'open' else 'closed' end,
+               case when $2 and 1 >= $4 then to_timestamp($3 / 1000.0) else null end,
                case when $2 then $5 else null end,
                to_timestamp($3 / 1000.0))
        on conflict (corridor_id) do update set

@@ -110,6 +110,19 @@ function fakeDb(): Queryable & { table: Map<string, FakeRow> } {
       const threshold = params[3] as number;
       const error = (params[4] as string | null) ?? null;
 
+      // A column missing from the INSERT list is not "set to null by the
+      // author", it is *absent*, and takes the table default — which for
+      // `tripped_at` is NULL. That distinction is the whole reason this fake
+      // reads the statement instead of restating it: re-implementing the rule
+      // from the author's understanding is what let a lane trip on its first
+      // failure with no `tripped_at` reach the real database unnoticed.
+      const insertCols =
+        /insert into corridor_breakers\s*\(([\s\S]*?)\)\s*values/i.exec(
+          text,
+        )?.[1];
+      const insertCarriesTrippedAt =
+        insertCols?.includes("tripped_at") === true;
+
       const next: FakeRow = {
         corridor_id: id,
         consecutiveFailures: failure ? (current?.consecutiveFailures ?? 0) + 1 : 0,
@@ -123,7 +136,11 @@ function fakeDb(): Queryable & { table: Map<string, FakeRow> } {
       };
       if (failure && next.consecutiveFailures >= threshold) {
         next.state = "open";
-        if (current?.state !== "open") next.tripped_at = at;
+        if (current?.state !== "open") {
+          // On the conflict path the UPDATE clause stamps it unconditionally.
+          // On the insert path it is only there if the column was listed.
+          if (current || insertCarriesTrippedAt) next.tripped_at = at;
+        }
       }
       table.set(id, next);
       return { rows: [outgoing(next) as R] };
@@ -166,6 +183,24 @@ describe("PostgresCorridorHealthStore.recordOutcome", () => {
     expect(second.state).toBe("open");
     expect(second.trippedAt).toBe(1000);
     expect(justTripped(second, 5000)).toBe(false);
+  });
+
+  it("stamps tripped_at when the FIRST failure is also the trip", async () => {
+    // The insert path, not the conflict path. With `consecutive_failures: 1` a
+    // lane's very first failure opens the breaker, and the row is created by
+    // the INSERT branch of the upsert. If that branch does not carry
+    // `tripped_at`, the row says `open` with a null trip time — and since
+    // `justTripped` matches on the trip time, the `corridor_breaker_tripped`
+    // counter never fires for a lane that trips on contact. An operator asking
+    // `breaker status` gets `tripped: -` for a lane that is refusing traffic.
+    const s = new PostgresCorridorHealthStore(fakeDb());
+    const r = await s.recordOutcome("brand-new", "failure", 1000, {
+      threshold: 1,
+      error: "SETTLEMENT_FAILED: x",
+    });
+    expect(r.state).toBe("open");
+    expect(r.trippedAt).toBe(1000);
+    expect(justTripped(r, 1000)).toBe(true);
   });
 
   it("binds exactly the five parameters its statements reference", async () => {

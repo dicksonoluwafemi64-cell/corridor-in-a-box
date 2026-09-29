@@ -250,7 +250,144 @@ describe("circuit-breaker metrics", () => {
     await health.reset("ng-cn", "ezedike", "anchor restored", 1000);
     expect(m.render()).toContain('corridor_breaker_reset{corridor="ng-cn"} 1');
   });
+
+  it("counts the trip when a Postgres lane trips on its first failure", async () => {
+    // End of the chain the insert-path bug cut. The metered store increments
+    // `tripped` only when `justTripped` matches, which needs `tripped_at` on
+    // the row; a lane created by the INSERT branch used to come back `open`
+    // with a null trip time, so with `consecutive_failures: 1` the counter
+    // that the whole alert is built on stayed at zero for exactly the lanes
+    // that trip on contact. The in-memory store stamped it, so nothing else
+    // noticed.
+    const m = new PrometheusMetrics();
+    const health = new MeteredCorridorHealthStore(
+      new PostgresCorridorHealthStore(fakeBreakerDb()),
+      m,
+    );
+    const c = buildCorridor("test", 1);
+    const r = await execute(
+      { ...intent, idempotencyKey: "pg-trip" },
+      c,
+      {
+        ...deps(m as unknown as InMemoryMetrics, {}, {
+          health,
+          failSubmit: true,
+        }),
+        idempotency: new InMemoryIdempotencyStore(),
+      },
+    );
+    expect(r.ok).toBe(false);
+    expect(m.render()).toContain('corridor_breaker_tripped{corridor="test"} 1');
+
+    // And the lane is actually refusing the next run, which is the other half
+    // of the operator promise.
+    const second = await execute(
+      { ...intent, idempotencyKey: "pg-trip-2" },
+      c,
+      {
+        ...deps(m as unknown as InMemoryMetrics, {}, {
+          health,
+          failSubmit: true,
+        }),
+        idempotency: new InMemoryIdempotencyStore(),
+      },
+    );
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.error.code).toBe("CORRIDOR_HALTED");
+    expect(m.render()).toContain('corridor_breaker_refused{corridor="test"} 1');
+  });
 });
+
+/**
+ * A `Queryable` that applies the store's upsert for real, including the part
+ * that a stub cannot fake: a column missing from the INSERT list is absent, not
+ * null, and so takes the table default. `tripped_at` defaults to NULL, which is
+ * how the first-failure trip lost its timestamp.
+ */
+function fakeBreakerDb(): Queryable {
+  interface Row {
+    corridor_id: string;
+    consecutive_failures: number;
+    state: string;
+    tripped_at: Date | null;
+    last_error: string | null;
+    reset_by: string | null;
+    reset_reason: string | null;
+    reset_at: Date | null;
+    updated_at: Date;
+  }
+  const table = new Map<string, Row>();
+  return {
+    async query<R = Record<string, unknown>>(
+      text: string,
+      params: unknown[] = [],
+    ): Promise<QueryResult<R>> {
+      // The gate reads the lane through `get()` before every run, so a fake
+      // that only models upserts answers the wrong question and the second run
+      // is quietly accepted.
+      if (/^\s*select\b/i.test(text)) {
+        const rows = text.includes("order by")
+          ? [...table.values()]
+            : [table.get(params[0] as string)].filter(
+                (r): r is Row => r !== undefined,
+              );
+        return { rows: rows as R[] };
+      }
+
+      const current = table.get(params[0] as string);
+      if (text.includes("reset_by = excluded.reset_by")) {
+        const next: Row = {
+          corridor_id: params[0] as string,
+          consecutive_failures: 0,
+          state: "closed",
+          tripped_at: null,
+          last_error: null,
+          reset_by: params[1] as string,
+          reset_reason: params[2] as string,
+          reset_at: new Date(params[3] as number),
+          updated_at: new Date(params[3] as number),
+        };
+        table.set(next.corridor_id, next);
+        return { rows: [next as R] };
+      }
+      const failure = params[1] as boolean;
+      const at = params[2] as number;
+      const threshold = params[3] as number;
+      const insertCols = /insert into corridor_breakers\s*\(([\s\S]*?)\)\s*values/i.exec(
+        text,
+      )?.[1];
+      // `pg` hands a `timestamptz` back as a Date; `toMs` parses strings and
+      // calls `getTime()` on Dates, so returning a raw epoch number here would
+      // make every trip time NaN and hide the very thing under test.
+      const next: Row = {
+        corridor_id: params[0] as string,
+        consecutive_failures: failure
+          ? (current?.consecutive_failures ?? 0) + 1
+          : 0,
+        state: "closed",
+        tripped_at: current?.tripped_at ?? null,
+        last_error: failure
+          ? ((params[4] as string) ?? null)
+          : (current?.last_error ?? null),
+        reset_by: current?.reset_by ?? null,
+        reset_reason: current?.reset_reason ?? null,
+        reset_at: current?.reset_at ?? null,
+        updated_at: new Date(at),
+      };
+      if (failure && next.consecutive_failures >= threshold) {
+        next.state = "open";
+        if (
+          current?.state !== "open" &&
+          (current || insertCols?.includes("tripped_at"))
+        ) {
+          next.tripped_at = new Date(at);
+        }
+      }
+      table.set(next.corridor_id, next);
+      return { rows: [next as R] };
+    },
+  };
+}
 
 function sanitize(name: string): string {
   return name.replace(/[^a-zA-Z0-9_]/g, "_");
