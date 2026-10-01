@@ -116,12 +116,10 @@ function fakeDb(): Queryable & { table: Map<string, FakeRow> } {
       // reads the statement instead of restating it: re-implementing the rule
       // from the author's understanding is what let a lane trip on its first
       // failure with no `tripped_at` reach the real database unnoticed.
-      const insertCols =
-        /insert into corridor_breakers\s*\(([\s\S]*?)\)\s*values/i.exec(
-          text,
-        )?.[1];
-      const insertCarriesTrippedAt =
-        insertCols?.includes("tripped_at") === true;
+      const insertCols = /insert into corridor_breakers\s*\(([\s\S]*?)\)\s*values/i.exec(
+        text,
+      )?.[1];
+      const insertCarriesTrippedAt = insertCols?.includes("tripped_at") === true;
 
       const next: FakeRow = {
         corridor_id: id,

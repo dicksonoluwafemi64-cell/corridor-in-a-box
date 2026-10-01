@@ -97,13 +97,37 @@ describe("breakerOutcomeFor", () => {
     }
   });
 
-  it("counts any pre-settle gate refusal as a lane failure", () => {
+  it("counts the pre-settle checks that read the chain as lane failures", () => {
     // These are checked against the chain and the anchor, so a refusal says
     // something about the lane and not only about this request.
-    expect(breakerOutcomeFor("failed", "PRESETTLE_INSUFFICIENT_FUNDS")).toBe("failure");
-    expect(breakerOutcomeFor("failed", "PRESETTLE_ANCHOR_DRIFT" as CorridorErrorCode)).toBe(
-      "failure",
-    );
+    const codes: CorridorErrorCode[] = [
+      "PRESETTLE_INSUFFICIENT_FUNDS",
+      "PRESETTLE_ANCHOR_DRIFT",
+      "PRESETTLE_TX_MISMATCH",
+      "PRESETTLE_DESTINATION_UNSAFE",
+    ];
+    for (const code of codes) {
+      expect(breakerOutcomeFor("failed", code)).toBe("failure");
+    }
+  });
+
+  it("does NOT count pre-settle refusals that are about the request", () => {
+    // The counter-case, and the reason pre-settle codes are listed one by one
+    // instead of matched on the `PRESETTLE_` prefix. A stale quote, an amount
+    // the anchor will not take and a receiver whose SEP-12 status lapsed are all
+    // true on a lane that is working perfectly well. If these counted, ordinary
+    // payment errors would halt a healthy corridor and a human would have to
+    // reopen it. Upstream added exactly these codes in #317/#358; a prefix test
+    // would have silently turned all three into new ways to take a lane down.
+    const codes: CorridorErrorCode[] = [
+      "PRESETTLE_QUOTE_WINDOW",
+      "PRESETTLE_AMOUNT_OUT_OF_RANGE",
+      "PRESETTLE_RECEIVER_NOT_ACCEPTED",
+      "CORRIDOR_UNPROVEN",
+    ];
+    for (const code of codes) {
+      expect(breakerOutcomeFor("failed", code)).toBe("neutral");
+    }
   });
 
   it("does NOT count quote, KYC or pre-open failures", () => {

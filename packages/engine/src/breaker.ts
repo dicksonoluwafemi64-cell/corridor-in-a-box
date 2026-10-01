@@ -8,10 +8,11 @@
 //   1. WHICH run outcomes count. `breakerOutcomeFor` is a pure function of the
 //      terminal state plus the error code, so "does this failure mean the lane
 //      is unhealthy" is answerable without a database and is unit-testable as
-//      such. A quote that expired, a KYC rejection or a pre-settle gate refusal
-//      is the caller's problem and must never take a lane down; a reconcile
-//      that stalled with money already on the chain is exactly the signal we
-//      want to stop on.
+//      such. Most pre-settle refusals are about the request — a quote that
+//      expired, a KYC rejection, an amount outside the anchor's limits — and
+//      must never take a lane down. A reconcile that stalled with money already
+//      on the chain is exactly the signal we want to stop on. See
+//      `LANE_FAILURE_CODES` for the full argument.
 //
 //   2. WHERE the count is kept. `CorridorHealthStore` is a port. The in-memory
 //      implementation is right for a single process and for tests; the Postgres
@@ -23,7 +24,7 @@
 // tripped until a person records why it was safe to reopen. That is the whole
 // point — an automatic reopen just moves the outage later and hides it.
 
-import { isPreSettleCode, type CorridorErrorCode } from "@corridor/types";
+import type { CorridorErrorCode } from "@corridor/types";
 import type { CorridorState } from "./state";
 import { noopMetrics, type Metrics } from "./observability";
 
@@ -110,12 +111,32 @@ export interface RecordOutcomeOptions {
  * tripping a lane over it would halt every corridor that has ever parked a
  * payment. A run that got there via `holdAndStop` passes the ORIGINAL failure
  * code instead, so the reconcile/settlement problem still counts.
+ *
+ * Pre-settle codes are listed one by one rather than matched on the
+ * `PRESETTLE_` prefix, and the distinction is not cosmetic. Most pre-settle
+ * refusals are about the request, not the lane: an amount outside the anchor's
+ * limits, a quote too short-lived to survive settle plus confirm, a receiver
+ * whose SEP-12 status is no longer ACCEPTED. None of those get better if the
+ * lane halts, so counting them would let ordinary payment errors stop a working
+ * corridor and would need a human to reopen it. A prefix test cannot tell those
+ * apart from the checks that really do read the chain, and adding a new
+ * pre-settle check upstream would silently become a new way to take a lane
+ * down. So the set is explicit, and a new pre-settle code is neutral until
+ * someone argues otherwise.
  */
 const LANE_FAILURE_CODES: ReadonlySet<CorridorErrorCode> = new Set<CorridorErrorCode>([
   "SETTLEMENT_FAILED",
   "SETTLEMENT_TIMEOUT",
   "RECONCILE_MISMATCH",
   "RECONCILE_STALLED",
+  // Pre-settle checks that read the chain or the anchor. These are evidence
+  // about the lane: our balance cannot cover the payment, the anchor drifted
+  // from what it promised, or the transaction it opened is not the one we are
+  // about to pay. Any of them means the leg is not working.
+  "PRESETTLE_INSUFFICIENT_FUNDS",
+  "PRESETTLE_ANCHOR_DRIFT",
+  "PRESETTLE_TX_MISMATCH",
+  "PRESETTLE_DESTINATION_UNSAFE",
 ]);
 
 /** Pure classifier: does this terminal run count against the lane? */
@@ -128,9 +149,7 @@ export function breakerOutcomeFor(
   // still in flight or a mid-run step.
   if (state !== "failed" && state !== "held" && state !== "refunded") return "neutral";
   if (code === undefined) return "neutral";
-  // Any pre-settle gate refusal (balance, anchor drift, tx mismatch) is checked
-  // against the chain/anchor, so it is evidence about the lane, not the caller.
-  return LANE_FAILURE_CODES.has(code) || isPreSettleCode(code) ? "failure" : "neutral";
+  return LANE_FAILURE_CODES.has(code) ? "failure" : "neutral";
 }
 
 /** Does `recordOutcome` transitioning to this row mean "this call tripped it"? */
