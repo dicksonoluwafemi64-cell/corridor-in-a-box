@@ -181,12 +181,12 @@ export function formatBreakerTable(records: readonly BreakerRecord[]): string {
   return [line(header), line(widths.map((w) => "-".repeat(w))), ...order.map(line)].join("\n");
 }
 
-/** Confirmation for a `reset`, including whether the lane was actually halted. */
-export function formatBreakerReset(
-  record: BreakerRecord,
-  by: string,
-  wasOpen: boolean,
-): string {
+/**
+ * Confirmation for a `reset`, including whether the lane was actually halted.
+ * `by` is the name the store recorded (`record.resetBy`), not the caller's own
+ * claim: the confirmation shows exactly what was written to the audit trail.
+ */
+export function formatBreakerReset(record: BreakerRecord, wasOpen: boolean): string {
   const lines = [
     `corridor: ${record.corridorId}`,
     `breaker:  ${marker(record.state)} — reset at ${iso(record.updatedAt)}`,
@@ -197,7 +197,7 @@ export function formatBreakerReset(
     // had failed, and it should be visible that nothing was actually released.
     lines.push("note:     this corridor was not halted — the reset was recorded anyway.");
   }
-  lines.push(`by:       ${by}`);
+  lines.push(`by:       ${record.resetBy ?? "unknown"}`);
   lines.push(`reason:   "${record.resetReason ?? ""}"`);
   return lines.join("\n");
 }

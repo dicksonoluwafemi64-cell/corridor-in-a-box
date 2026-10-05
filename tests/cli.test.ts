@@ -781,14 +781,28 @@ describe("breaker status output", () => {
         resetAt: 5000,
         updatedAt: 5000,
       },
-      "ezedike",
       true,
     );
     expect(out).toContain("CLOSED");
-    expect(out).toContain("ezedike");
+    expect(out).toContain("by:       ezedike");
     expect(out).toContain("anchor confirmed healthy");
     // The lane really was halted, so there is no caveat to print.
     expect(out).not.toContain("not halted");
+  });
+
+  it("prints the name the store recorded, and 'unknown' when it recorded none", () => {
+    const base = {
+      corridorId: "ng-cn",
+      state: "closed" as const,
+      consecutiveFailures: 0,
+      resetReason: "r",
+      resetAt: 5000,
+      updatedAt: 5000,
+    };
+    expect(formatBreakerReset({ ...base, resetBy: "recorded-name" }, true)).toContain(
+      "by:       recorded-name",
+    );
+    expect(formatBreakerReset(base, true)).toContain("by:       unknown");
   });
 
   it("flags a reset of a lane that was not halted", () => {
@@ -804,7 +818,6 @@ describe("breaker status output", () => {
         resetAt: 5000,
         updatedAt: 5000,
       },
-      "ezedike",
       false,
     );
     expect(out).toContain("was not halted");

@@ -243,7 +243,7 @@ async function breakerReset(
   const before = await store.get(command.corridorId);
   const by = currentUser();
   const record = await store.reset(command.corridorId, by, command.reason);
-  console.log(formatBreakerReset(record, by, before?.state === "open"));
+  console.log(formatBreakerReset(record, before?.state === "open"));
   return EXIT_OK;
 }
 
