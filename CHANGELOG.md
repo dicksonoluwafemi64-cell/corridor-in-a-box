@@ -7,6 +7,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Added — pre-settle gate results are logged per check and copied into the audit trail ([#142](https://github.com/ezedike-evan/corridor-in-a-box/issues/142))
+
+Building on `AuditEntry.checks`, each gate check on the transition out of
+`verifying` is now also logged as `corridor.gate.check` — `info` when it
+passed, `warn` when it failed — and the audit entry takes a copy of the
+`checks` array, so a caller mutating its array afterwards cannot change what was
+recorded. `CheckResult.detail` is documented as PII-free: ids, amounts, asset
+codes, G-addresses and statuses only.
+
 ### Added — Legacy flat SEP-31 dest endpoints: deprecation warning (#180)
 
 - `parseCorridor` / `loadCorridor` now return `warnings: string[]` on success (additive; still assignable to `Outcome<Corridor>`).

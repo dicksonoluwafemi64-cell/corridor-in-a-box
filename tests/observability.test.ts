@@ -10,7 +10,9 @@ import {
   createMockSubmitter,
   execute,
   reconcileUntil,
+  type CheckResult,
   type EngineDeps,
+  type PreSettleGate,
 } from "@corridor/engine";
 import type { PaymentIntent } from "@corridor/types";
 
@@ -339,5 +341,132 @@ describe("reconcile polling observability", () => {
     const pollMetrics = metrics.counters.filter((c) => c.name === "corridor.reconcile.poll");
     expect(pollMetrics.length).toBeGreaterThanOrEqual(1);
     expect(pollMetrics[0].tags?.corridor).toBe("test");
+  });
+});
+
+// The gate runs inside execute(), so these assert through a real run: the gate's
+// results land on the transition into `verifying` (and on `failed` when it refuses).
+describe("pre-settle gate results in the audit trail", () => {
+  const passing: CheckResult = {
+    name: "chain.balance",
+    passed: true,
+    detail: "GSENDER holds 250.00 USDC, needs 100.00",
+    durationMs: 12,
+  };
+  const failing: CheckResult = {
+    name: "sep31.info.asset",
+    passed: false,
+    code: "SETTLEMENT_FAILED",
+    detail: "anchor /info does not list USDC:GISSUER",
+    durationMs: 40,
+  };
+  const capture = () => {
+    const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    return {
+      logs,
+      logger: {
+        log(level: string, msg: string, fields?: Record<string, unknown>) {
+          logs.push({ level, msg, fields });
+        },
+      },
+    };
+  };
+  const gateOf = (results: CheckResult[]): PreSettleGate => ({
+    evaluate: async () => ({ passed: results.every((r) => r.passed), results }),
+  });
+  const depsWith = (over: Partial<EngineDeps>): EngineDeps => ({
+    resolver: new StaticRouteResolver(() => createMockAdapter(), {
+      trustManifestWithoutAttestation: true,
+    }),
+    submitter: createMockSubmitter(),
+    idempotency: new InMemoryIdempotencyStore(),
+    trustManifestWithoutAttestation: true,
+    ...over,
+  });
+
+  it("records one result per configured check and logs each at info when they pass", async () => {
+    const audit = new InMemoryAuditLog();
+    const { logs, logger } = capture();
+    const checks = [passing, { ...passing, name: "stellar.toml.hash", detail: "match" }];
+
+    const r = await execute(
+      { ...intent, idempotencyKey: "obs-gate-pass" },
+      corridor(),
+      depsWith({ audit, logger, gate: gateOf(checks) }),
+    );
+    expect(r.ok).toBe(true);
+
+    const entry = audit.entries.find((e) => e.to === "verifying")!;
+    expect(entry.checks).toHaveLength(checks.length);
+    expect(entry.checks).toEqual(checks);
+
+    const gateLogs = logs.filter((l) => l.msg === "corridor.gate.check");
+    expect(gateLogs.map((l) => l.level)).toEqual(["info", "info"]);
+  });
+
+  it("records failed checks with passed:false, code and detail when the gate refuses", async () => {
+    const audit = new InMemoryAuditLog();
+    const { logs, logger } = capture();
+
+    const r = await execute(
+      { ...intent, idempotencyKey: "obs-gate-fail" },
+      corridor(),
+      depsWith({ audit, logger, gate: gateOf([passing, failing]) }),
+    );
+    expect(r.ok).toBe(false);
+
+    const entry = audit.entries.find((e) => e.to === "failed")!;
+    expect(entry.error).toContain("SETTLEMENT_FAILED");
+    expect(entry.checks).toHaveLength(2);
+    expect(entry.checks?.find((c) => !c.passed)).toEqual({
+      name: "sep31.info.asset",
+      passed: false,
+      code: "SETTLEMENT_FAILED",
+      detail: "anchor /info does not list USDC:GISSUER",
+      durationMs: 40,
+    });
+
+    // info for the pass, warn for the failure — one line each (the first two lines
+    // come from the transition into `verifying`; the refusal re-logs them on `failed`).
+    const gateLogs = logs.filter((l) => l.msg === "corridor.gate.check");
+    expect(gateLogs.slice(0, 2).map((l) => [l.level, l.fields?.check])).toEqual([
+      ["info", "chain.balance"],
+      ["warn", "sep31.info.asset"],
+    ]);
+    expect(gateLogs[1]!.fields).toMatchObject({
+      idempotencyKey: "obs-gate-fail",
+      passed: false,
+      code: "SETTLEMENT_FAILED",
+      detail: "anchor /info does not list USDC:GISSUER",
+    });
+    // The transition lines stay flat; the results live on the per-check lines.
+    const transitions = logs.filter((l) => l.msg === "corridor.transition");
+    expect(transitions.length).toBeGreaterThan(0);
+    for (const t of transitions) expect(t.fields).not.toHaveProperty("checks");
+  });
+
+  it("does not snapshot a caller's later mutation of the checks array", async () => {
+    const audit = new InMemoryAuditLog();
+    const checks = [passing];
+    const r = await execute(
+      { ...intent, idempotencyKey: "obs-gate-copy" },
+      corridor(),
+      depsWith({ audit, gate: gateOf(checks) }),
+    );
+    expect(r.ok).toBe(true);
+    checks.push(failing);
+    expect(audit.entries.find((e) => e.to === "verifying")!.checks).toHaveLength(1);
+  });
+
+  it("leaves checks off every transition that is not into verifying or failed-by-gate", async () => {
+    const audit = new InMemoryAuditLog();
+    const r = await execute(
+      { ...intent, idempotencyKey: "obs-nochecks" },
+      corridor(),
+      depsWith({ audit, gate: gateOf([passing]) }),
+    );
+    expect(r.ok).toBe(true);
+    const withChecks = audit.entries.filter((e) => "checks" in e).map((e) => e.to);
+    expect(withChecks).toEqual(["verifying"]);
   });
 });

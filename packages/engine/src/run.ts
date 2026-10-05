@@ -860,9 +860,26 @@ async function emitTransition(
     ...(meta?.networkFee && { networkFee: meta.networkFee }),
     ...(meta?.amountRefunded !== undefined && { amountRefunded: meta.amountRefunded }),
     ...(meta?.amountFee !== undefined && { amountFee: meta.amountFee }),
-    ...(meta?.checks && meta.checks.length > 0 && { checks: meta.checks }),
+    // A copy, so a caller mutating its array afterwards cannot change what was recorded.
+    ...(meta?.checks && meta.checks.length > 0 && { checks: [...meta.checks] }),
   };
-  (deps.logger ?? silentLogger).log(error ? "error" : "info", "corridor.transition", entry);
+  const logger = deps.logger ?? silentLogger;
+  for (const c of meta?.checks ?? []) {
+    // Only the check's own fields: `detail` is PII-free by contract (see
+    // CheckResult) and nothing about the sender or recipient is added here.
+    logger.log(c.passed ? "info" : "warn", "corridor.gate.check", {
+      idempotencyKey: run.idempotencyKey,
+      corridorId: run.corridorId,
+      check: c.name,
+      passed: c.passed,
+      ...(c.code && { code: c.code }),
+      detail: c.detail,
+      durationMs: c.durationMs,
+    });
+  }
+  // The per-check lines carry the results; keep the transition line flat.
+  const { checks: _checks, ...transition } = entry;
+  logger.log(error ? "error" : "info", "corridor.transition", transition);
   const metrics = deps.metrics ?? noopMetrics;
   metrics.increment("corridor.transition", { to: run.state, corridor: run.corridorId });
   if (isTerminal(run.state)) {
