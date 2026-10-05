@@ -60,6 +60,32 @@ run("PostgresCorridorHealthStore (live Postgres)", () => {
     expect(res.rows[0].n).toBe(1);
   });
 
+  it("migrate() upgrades the legacy #366 table in place", async () => {
+    // The shape main's stub migrate() created: no reset_at, 'up'/'down' states.
+    await pool.query("drop table corridor_breakers");
+    await pool.query(`create table corridor_breakers (
+      corridor_id text primary key,
+      consecutive_failures integer not null default 0,
+      state text not null default 'up',
+      tripped_at timestamptz,
+      last_error text,
+      reset_by text,
+      reset_reason text,
+      updated_at timestamptz not null default now()
+    )`);
+    await pool.query(
+      "insert into corridor_breakers (corridor_id, state) values ('up-lane', 'up'), ('down-lane', 'down')",
+    );
+    await migrate(pool as unknown as Queryable);
+    await migrate(pool as unknown as Queryable); // and again: idempotent
+    const s = store();
+    expect(await s.get("up-lane")).toMatchObject({ state: "closed" });
+    expect(await s.get("down-lane")).toMatchObject({ state: "open" });
+    // The statement that used to fail on every payment now works.
+    expect(await s.list()).toHaveLength(2);
+    expect(await fail("fresh", 1000, 1)).toMatchObject({ state: "open" });
+  });
+
   it("opens on the Kth failure and stays open afterwards", async () => {
     expect(await fail("c", 1000, 3)).toMatchObject({
       state: "closed",

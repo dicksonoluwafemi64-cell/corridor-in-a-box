@@ -34,12 +34,20 @@ function buildCorridor(id: string, breaker?: number): Corridor {
       endpoints: {
         home_domain: "d.example",
         transfer_server_sep31: "https://d.example/sep31",
+        endpoints_verified_at: "1970-01-01",
       },
     },
     fx: { path: ["ARS", "USDC", "ARS"], who_holds_risk: "receiving_anchor" },
     compliance: { source_jurisdiction: "AR", dest_jurisdiction: "AR" },
     settlement: { network: "public", asset_issuer: "GISSUER" },
     recovery: breaker === undefined ? {} : { breaker: { consecutive_failures: breaker } },
+    proof: {
+      canary_completed_at: "1970-01-01T00:00:00Z",
+      stellar_tx_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      anchor_transaction_id: "canary-test",
+      amount: "1",
+      max_age_days: 50000,
+    },
   });
   if (!r.ok) throw new Error("fixture invalid");
   return r.value;
@@ -68,6 +76,7 @@ function deps(
     health: extra.health,
     sleep: async () => {},
     trustManifestWithoutAttestation: true,
+    unsafeSkipPreSettleGate: true,
   };
 }
 
@@ -265,33 +274,33 @@ describe("circuit-breaker metrics", () => {
       m,
     );
     const c = buildCorridor("test", 1);
-    const r = await execute(
-      { ...intent, idempotencyKey: "pg-trip" },
-      c,
-      {
-        ...deps(m as unknown as InMemoryMetrics, {}, {
+    const r = await execute({ ...intent, idempotencyKey: "pg-trip" }, c, {
+      ...deps(
+        m as unknown as InMemoryMetrics,
+        {},
+        {
           health,
           failSubmit: true,
-        }),
-        idempotency: new InMemoryIdempotencyStore(),
-      },
-    );
+        },
+      ),
+      idempotency: new InMemoryIdempotencyStore(),
+    });
     expect(r.ok).toBe(false);
     expect(m.render()).toContain('corridor_breaker_tripped{corridor="test"} 1');
 
     // And the lane is actually refusing the next run, which is the other half
     // of the operator promise.
-    const second = await execute(
-      { ...intent, idempotencyKey: "pg-trip-2" },
-      c,
-      {
-        ...deps(m as unknown as InMemoryMetrics, {}, {
+    const second = await execute({ ...intent, idempotencyKey: "pg-trip-2" }, c, {
+      ...deps(
+        m as unknown as InMemoryMetrics,
+        {},
+        {
           health,
           failSubmit: true,
-        }),
-        idempotency: new InMemoryIdempotencyStore(),
-      },
-    );
+        },
+      ),
+      idempotency: new InMemoryIdempotencyStore(),
+    });
     expect(second.ok).toBe(false);
     if (!second.ok) expect(second.error.code).toBe("CORRIDOR_HALTED");
     expect(m.render()).toContain('corridor_breaker_refused{corridor="test"} 1');
@@ -328,9 +337,7 @@ function fakeBreakerDb(): Queryable {
       if (/^\s*select\b/i.test(text)) {
         const rows = text.includes("order by")
           ? [...table.values()]
-            : [table.get(params[0] as string)].filter(
-                (r): r is Row => r !== undefined,
-              );
+          : [table.get(params[0] as string)].filter((r): r is Row => r !== undefined);
         return { rows: rows as R[] };
       }
 
@@ -361,14 +368,10 @@ function fakeBreakerDb(): Queryable {
       // make every trip time NaN and hide the very thing under test.
       const next: Row = {
         corridor_id: params[0] as string,
-        consecutive_failures: failure
-          ? (current?.consecutive_failures ?? 0) + 1
-          : 0,
+        consecutive_failures: failure ? (current?.consecutive_failures ?? 0) + 1 : 0,
         state: "closed",
         tripped_at: current?.tripped_at ?? null,
-        last_error: failure
-          ? ((params[4] as string) ?? null)
-          : (current?.last_error ?? null),
+        last_error: failure ? ((params[4] as string) ?? null) : (current?.last_error ?? null),
         reset_by: current?.reset_by ?? null,
         reset_reason: current?.reset_reason ?? null,
         reset_at: current?.reset_at ?? null,
@@ -376,10 +379,7 @@ function fakeBreakerDb(): Queryable {
       };
       if (failure && next.consecutive_failures >= threshold) {
         next.state = "open";
-        if (
-          current?.state !== "open" &&
-          (current || insertCols?.includes("tripped_at"))
-        ) {
+        if (current?.state !== "open" && (current || insertCols?.includes("tripped_at"))) {
           next.tripped_at = new Date(at);
         }
       }

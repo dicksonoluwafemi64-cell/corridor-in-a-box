@@ -45,6 +45,19 @@ create table if not exists corridor_breakers (
   updated_at           timestamptz not null default now()
 );`;
 
+/**
+ * In-place upgrade of the stub `corridor_breakers` table that #366's migrate()
+ * created (no `reset_at`, default 'up', states 'up'/'down'). All idempotent, so
+ * they are safe on a fresh table and on repeated runs. Order matters: the
+ * default changes before legacy rows are remapped.
+ */
+export const BREAKERS_MIGRATION_SQL = [
+  `alter table corridor_breakers add column if not exists reset_at timestamptz;`,
+  `alter table corridor_breakers alter column state set default 'closed';`,
+  `update corridor_breakers set state = 'open' where state = 'down';`,
+  `update corridor_breakers set state = 'closed' where state = 'up';`,
+];
+
 interface Row {
   corridor_id: string;
   consecutive_failures: number;

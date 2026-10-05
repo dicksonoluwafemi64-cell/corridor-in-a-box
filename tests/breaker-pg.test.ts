@@ -8,7 +8,9 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  BREAKERS_MIGRATION_SQL,
   CREATE_BREAKERS_TABLE_SQL,
+  CREATE_TABLE_SQL,
   PostgresCorridorHealthStore,
   justTripped,
   migrate,
@@ -328,6 +330,80 @@ describe("migrate() ships the breaker table", () => {
     await migrate(collect(once));
     await migrate(collect(twice));
     expect(twice).toEqual(once);
+  });
+});
+
+describe("migrate() upgrades the legacy #366 corridor_breakers table", () => {
+  // Databases that ran migrate() since #366 hold a table with no `reset_at`,
+  // default 'up' and states 'up'/'down'. `create table if not exists` is a no-op
+  // there, so without the extra statements every payment would fail selecting
+  // reset_at. The statements are interpreted over a tiny legacy-table model so
+  // the semantics (not just their text) are checked; tests/integration runs the
+  // same path against real Postgres.
+  function legacyDb() {
+    const legacy = {
+      columns: new Set([
+        "corridor_id",
+        "consecutive_failures",
+        "state",
+        "tripped_at",
+        "last_error",
+        "reset_by",
+        "reset_reason",
+        "updated_at",
+      ]),
+      stateDefault: "up",
+      rows: [
+        { corridor_id: "a", state: "up" },
+        { corridor_id: "b", state: "down" },
+      ],
+    };
+    const statements: string[] = [];
+    const db: Queryable = {
+      async query(text: string) {
+        statements.push(text);
+        const add = /alter table corridor_breakers add column if not exists (\w+)/i.exec(text);
+        if (add) legacy.columns.add(add[1]);
+        const def = /alter column state set default '(\w+)'/i.exec(text);
+        if (def) legacy.stateDefault = def[1];
+        const upd = /update corridor_breakers set state = '(\w+)' where state = '(\w+)'/i.exec(
+          text,
+        );
+        if (upd) for (const r of legacy.rows) if (r.state === upd[2]) r.state = upd[1];
+        return { rows: [] };
+      },
+    };
+    return { db, legacy, statements };
+  }
+
+  it("adds reset_at, defaults state to closed, and maps up/down to closed/open", async () => {
+    const { db, legacy } = legacyDb();
+    await migrate(db);
+    expect(legacy.columns.has("reset_at")).toBe(true);
+    expect(legacy.stateDefault).toBe("closed");
+    expect(legacy.rows).toEqual([
+      { corridor_id: "a", state: "closed" },
+      { corridor_id: "b", state: "open" },
+    ]);
+  });
+
+  it("is idempotent over the legacy table", async () => {
+    const { db, legacy } = legacyDb();
+    await migrate(db);
+    await migrate(db);
+    expect(legacy.rows.map((r) => r.state)).toEqual(["closed", "open"]);
+  });
+
+  it("runs the upgrade statements after the create, from migrate() alone", async () => {
+    const { db, statements } = legacyDb();
+    await migrate(db);
+    const create = statements.indexOf(CREATE_BREAKERS_TABLE_SQL);
+    expect(create).toBeGreaterThanOrEqual(0);
+    expect(statements.slice(create + 1)).toEqual([...BREAKERS_MIGRATION_SQL]);
+  });
+
+  it("defines corridor_breakers in exactly one place", () => {
+    expect(CREATE_TABLE_SQL).not.toContain("corridor_breakers");
   });
 });
 
